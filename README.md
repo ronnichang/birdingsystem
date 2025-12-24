@@ -1,0 +1,36 @@
+# Proj-birding (Raspberry Pi 4)
+
+A Raspberry Pi 4 “birding / backyard wildlife” recorder that:
+- Runs **YOLO (Ultralytics YOLOv8n)** on a low-res camera stream to detect animals.
+- Starts recording when a target animal is detected for **N consecutive frames**.
+- Stops recording after **M consecutive misses** (hysteresis) and a minimum clip length.
+- Saves clips to `captures/` using the filename format: `YYYYMMDD-HHMMSS-<animal>.mp4`.
+- Includes a **headless demo recorder** that produces a single MP4 with status overlays
+  (heartbeat text + flashing REC indicator) without needing VNC/monitor.
+- Optional: exposes `captures/` via a simple password-protected **nginx** web directory listing.
+
+## Hardware
+- Raspberry Pi 4
+- CSI camera (e.g., Arducam / Raspberry Pi Camera Module, OV5647-based)
+- (Optional) Motorized focus support via I2C (configurable)
+
+## Software
+- Raspberry Pi OS (Debian-based)
+- Python 3
+- `picamera2` / `libcamera`
+- `ultralytics` (YOLOv8)
+- `opencv-python`
+- `ffmpeg` (for demo MP4 writing, and/or video muxing)
+
+---
+
+## Repository Layout
+
+- `auto_bird_recorder.py`  
+  Main wildlife recorder: YOLO detection + start/stop recording + camera restart reliability.
+
+- `demo_headless_overlay.py`  
+  Headless demo: writes a **single continuous MP4** with overlays burned in (no GUI required).
+
+- `captures/`  
+  Output directory for recordings and demo videos.
