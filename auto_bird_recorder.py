@@ -1,57 +1,89 @@
+#!/usr/bin/env python3
+"""
+auto_bird_recorder.py
+
+- Uses Picamera2 dual-stream:
+  - main: recording (YUV420 @ RESOLUTION)
+  - lores: detection (YUV420 @ DETECT_RESOLUTION)
+- Runs YOLOv8n on lores frames.
+- Starts recording after START_CONFIRM_FRAMES consecutive strong detections.
+- Stops after STOP_CONFIRM_FRAMES consecutive misses AND after MIN_RECORD_SECONDS.
+- Restarts the camera pipeline after every stop (reliability on Pi/libcamera).
+- Watchdog requests a camera restart if capture/inference blocks too long.
+"""
+
 import os
 import cv2
 import time
 import datetime
 import threading
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
 from ultralytics import YOLO
 from picamera2 import Picamera2
 from picamera2.encoders import H264Encoder
 from picamera2.outputs import FfmpegOutput
 
 
-# --- 1. CONFIGURATION ---
-WINNING_FOCUS = 500
-TARGET_ANIMALS = ['bird', 'cat', 'dog', 'squirrel']
+# ---------------------------
+# 1) CONFIG
+# ---------------------------
 
-# Recording control
-START_CONFIRM_FRAMES = 3            # N consecutive detections required to START recording
-STOP_CONFIRM_FRAMES = 10           # N consecutive misses required to STOP recording (hysteresis)
-MIN_RECORD_SECONDS = 3.0           # never stop before this many seconds after starting
-POST_RECORD_COOLDOWN_SECONDS = 0.0 # cooldown after STOP before allowing next START
+@dataclass(frozen=True)
+class Settings:
+    # Focus
+    enable_manual_focus: bool = False
+    winning_focus: int = 500
 
-# Confidence thresholds
-START_MIN_CONF = 0.15              # must be >= this to count toward START_CONFIRM_FRAMES
-KEEP_MIN_CONF = 0.08               # YOLO runs with this to reduce flicker while recording
+    # Targets
+    target_animals: Tuple[str, ...] = ("bird", "cat", "dog", "squirrel")
 
-# Camera / performance
-ENABLE_MANUAL_FOCUS = False
-RESOLUTION = (1280, 720)           # main stream (recording)
-DETECT_RESOLUTION = (640, 360)     # lores stream (detection)
-DETECT_FPS = 8                     # throttle detection loop
-YOLO_IMG_SIZE = 320
-H264_BITRATE = 8_000_000
-BUFFER_COUNT = 6                   # slightly higher can reduce stalls
+    # Recording control
+    start_confirm_frames: int = 3
+    stop_confirm_frames: int = 10
+    min_record_seconds: float = 3.0
+    post_record_cooldown_seconds: float = 0.0  # set >0 if you want a deadband after stopping
 
-# Debug / visibility
-PRINT_DETECTION_PROGRESS = True
-PRINT_PROGRESS_EVERY_N_FRAMES = 1
-HEARTBEAT_SECONDS = 1.0
+    # Confidence thresholds
+    start_min_conf: float = 0.15
+    keep_min_conf: float = 0.08
 
-# Watchdog: if capture/inference blocks and no progress is made, restart camera
-PROGRESS_TIMEOUT_SECONDS = 20.0
+    # Camera / performance
+    resolution: Tuple[int, int] = (1280, 720)       # main (recording)
+    detect_resolution: Tuple[int, int] = (640, 360) # lores (detection)
+    detect_fps: float = 8.0
+    yolo_img_size: int = 320
+    h264_bitrate: int = 8_000_000
+    buffer_count: int = 6
 
-# Output
-CAPTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "captures")
-os.makedirs(CAPTURE_DIR, exist_ok=True)
+    # Debug
+    print_detection_progress: bool = True
+    print_progress_every_n_frames: int = 8
+    heartbeat_seconds: float = 1.0
+
+    # Watchdog
+    progress_timeout_seconds: float = 20.0
+
+    # Output
+    capture_dir: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "captures")
+    yolo_weights: str = "yolov8n.pt"
+
+
+CFG = Settings()
+os.makedirs(CFG.capture_dir, exist_ok=True)
 
 
 def log(msg: str) -> None:
     print(msg, flush=True)
 
 
-# --- 2. HARDWARE CONTROL FUNCTIONS ---
+# ---------------------------
+# 2) OPTIONAL FOCUS CONTROL
+# ---------------------------
+
 def set_manual_focus(val: int) -> None:
-    """Sets focus using system-level I2C commands via sudo."""
+    """Sets focus using system-level I2C commands via sudo (Arducam motor on bus 10, addr 0x0c)."""
     try:
         time.sleep(0.5)
         value = (val << 4) & 0x3ff0
@@ -64,295 +96,425 @@ def set_manual_focus(val: int) -> None:
         log(f"Focus Hardware Error: {e}")
 
 
-def create_and_start_camera() -> Picamera2:
-    """Create + configure + start Picamera2 with main+lores streams."""
-    picam2 = Picamera2()
-    config = picam2.create_video_configuration(
-        main={'size': RESOLUTION, 'format': 'YUV420'},
-        lores={'size': DETECT_RESOLUTION, 'format': 'YUV420'},
-        buffer_count=BUFFER_COUNT,
-    )
-    picam2.configure(config)
-    picam2.start()
-    return picam2
+# ---------------------------
+# 3) CAMERA PIPELINE (CREATE/RESET)
+# ---------------------------
 
+class CameraManager:
+    """Owns Picamera2 + encoder and can hard-restart the pipeline for reliability."""
 
-def safe_stop_close_camera(picam: Picamera2) -> None:
-    """Best-effort stop/close without throwing."""
-    try:
+    def __init__(self, cfg: Settings):
+        self.cfg = cfg
+        self.picam: Optional[Picamera2] = None
+        self.encoder: Optional[H264Encoder] = None
+
+    def start(self) -> None:
+        """Create + configure + start the camera and encoder."""
+        self.picam = Picamera2()
+        config = self.picam.create_video_configuration(
+            main={"size": self.cfg.resolution, "format": "YUV420"},
+            lores={"size": self.cfg.detect_resolution, "format": "YUV420"},
+            buffer_count=self.cfg.buffer_count,
+        )
+        self.picam.configure(config)
+        self.picam.start()
+        self.encoder = H264Encoder(bitrate=self.cfg.h264_bitrate)
+
+    def stop_close(self) -> None:
+        """Best-effort stop/close without throwing."""
+        if not self.picam:
+            return
         try:
-            picam.stop_recording()
-        except Exception:
-            pass
+            try:
+                self.picam.stop_recording()
+            except Exception:
+                pass
+            try:
+                self.picam.stop()
+            except Exception:
+                pass
+            try:
+                self.picam.close()
+            except Exception:
+                pass
+        finally:
+            self.picam = None
+            self.encoder = None
+
+    def restart(self, reason: str = "") -> None:
+        """Hard reset camera pipeline (fixes rare post-record deadlock)."""
+        if reason:
+            log(f"[recovery] Restarting camera pipeline ({reason})...")
+        else:
+            log("[recovery] Restarting camera pipeline...")
+        self.stop_close()
+        time.sleep(0.3)
+        self.start()
+        log("[recovery] Camera restarted.")
+
+    def capture_bgr_from_lores(self):
+        """Capture from lores stream and convert to BGR for YOLO."""
+        assert self.picam is not None
+        raw = self.picam.capture_array("lores")
+
+        # Rare case: already RGB
+        if raw.ndim == 3 and raw.shape[2] == 3:
+            return cv2.cvtColor(raw, cv2.COLOR_RGB2BGR)
+
         try:
-            picam.stop()
-        except Exception:
-            pass
-        try:
-            picam.close()
-        except Exception:
-            pass
-    except Exception:
-        pass
+            return cv2.cvtColor(raw, cv2.COLOR_YUV2BGR_I420)
+        except cv2.error:
+            return cv2.cvtColor(raw, cv2.COLOR_YUV2BGR_NV12)
 
 
-# --- 3. CAPTURE / CONVERT ---
-def capture_bgr_frame(picam: Picamera2):
-    """Capture from lores stream and convert to BGR for YOLO."""
-    raw = picam.capture_array("lores")
+# ---------------------------
+# 4) DETECTOR
+# ---------------------------
 
-    # Rare case: already RGB
-    if raw.ndim == 3 and raw.shape[2] == 3:
-        return cv2.cvtColor(raw, cv2.COLOR_RGB2BGR)
+class AnimalDetector:
+    """Wrap YOLO + target filtering and returns best (label, conf)."""
 
-    try:
-        return cv2.cvtColor(raw, cv2.COLOR_YUV2BGR_I420)
-    except cv2.error:
-        return cv2.cvtColor(raw, cv2.COLOR_YUV2BGR_NV12)
+    def __init__(self, cfg: Settings):
+        self.cfg = cfg
+        self.model = YOLO(cfg.yolo_weights)
+
+    def best_target(self, frame_bgr) -> Tuple[Optional[str], float]:
+        """
+        Run YOLO and return (label, conf) for best target animal.
+        YOLO runs with KEEP_MIN_CONF to reduce flicker while recording.
+        """
+        results = self.model(
+            frame_bgr,
+            verbose=False,
+            imgsz=self.cfg.yolo_img_size,
+            conf=self.cfg.keep_min_conf,
+        )
+
+        r0 = results[0]
+        if r0.boxes is None or len(r0.boxes) == 0:
+            return None, 0.0
+
+        best_label = None
+        best_conf = 0.0
+
+        for box in r0.boxes:
+            cls_id = int(box.cls[0])
+            label = self.model.names.get(cls_id, str(cls_id))
+            conf = float(box.conf[0]) if box.conf is not None else 0.0
+
+            if label in self.cfg.target_animals and conf > best_conf:
+                best_label = label
+                best_conf = conf
+
+        return best_label, best_conf
 
 
-# --- 4. DETECTION ---
-def get_best_detection(model: YOLO, frame_bgr):
+# ---------------------------
+# 5) RECORDER
+# ---------------------------
+
+class Recorder:
+    """Handles file naming and Picamera2 recording start/stop (including FfmpegOutput close)."""
+
+    def __init__(self, cfg: Settings):
+        self.cfg = cfg
+        self.output: Optional[FfmpegOutput] = None
+        self.record_start_time: float = 0.0
+
+    def make_filename(self, animal: str) -> str:
+        now = datetime.datetime.now()
+        base = now.strftime(f"%Y%m%d-%H%M%S-{animal}.mp4")
+        return os.path.join(self.cfg.capture_dir, base)
+
+    def start(self, cam: CameraManager, filename: str) -> None:
+        assert cam.picam is not None and cam.encoder is not None
+        self.output = FfmpegOutput(filename)
+        cam.picam.start_recording(cam.encoder, self.output)
+        self.record_start_time = time.time()
+
+    def stop(self, cam: CameraManager) -> None:
+        assert cam.picam is not None
+        cam.picam.stop_recording()
+        if self.output is not None:
+            try:
+                self.output.close()
+            except Exception:
+                pass
+        self.output = None
+
+
+# ---------------------------
+# 6) WATCHDOG
+# ---------------------------
+
+class ProgressWatchdog:
     """
-    Run YOLO and return (label, conf) for the best target animal.
-    YOLO runs with KEEP_MIN_CONF to reduce flicker while recording.
+    Watchdog thread:
+    - If loop progress stalls, request a camera restart (via event).
     """
-    results = model(frame_bgr, verbose=False, imgsz=YOLO_IMG_SIZE, conf=KEEP_MIN_CONF)
 
-    best_label = None
-    best_conf = 0.0
+    def __init__(self, timeout_seconds: float):
+        self.timeout_seconds = timeout_seconds
+        self._lock = threading.Lock()
+        self._last_progress = time.monotonic()
+        self.restart_flag = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
 
-    r0 = results[0]
-    if r0.boxes is None or len(r0.boxes) == 0:
-        return None, 0.0
+    def start(self) -> None:
+        self._thread.start()
 
-    for box in r0.boxes:
-        cls_id = int(box.cls[0])
-        label = model.names.get(cls_id, str(cls_id))
-        conf = float(box.conf[0]) if box.conf is not None else 0.0
+    def touch(self) -> None:
+        with self._lock:
+            self._last_progress = time.monotonic()
 
-        if label in TARGET_ANIMALS and conf > best_conf:
-            best_label = label
-            best_conf = conf
+    def _seconds_since_progress(self) -> float:
+        with self._lock:
+            return time.monotonic() - self._last_progress
 
-    return best_label, best_conf
-
-
-# --- 5. RECORDING HELPERS ---
-def make_filename(animal: str) -> str:
-    now = datetime.datetime.now()
-    base = now.strftime(f"%Y%m%d-%H%M%S-{animal}.mp4")
-    return os.path.join(CAPTURE_DIR, base)
-
-
-def start_recording(picam: Picamera2, encoder: H264Encoder, filename: str) -> FfmpegOutput:
-    output = FfmpegOutput(filename)
-    picam.start_recording(encoder, output)
-    return output
-
-
-def stop_recording(picam: Picamera2, output: FfmpegOutput | None) -> None:
-    """Stop recording and close ffmpeg output."""
-    picam.stop_recording()
-    if output is not None:
-        try:
-            output.close()
-        except Exception:
-            pass
-
-
-# --- 6. MAIN LOOP ---
-def run_event_loop(model: YOLO) -> None:
-    cooldown_announced = False
-    is_recording = False
-
-    # Start gating (N consecutive strong hits)
-    consecutive_hits = 0
-    pending_label = None
-
-    # Stop hysteresis (N consecutive misses while recording)
-    misses_while_recording = 0
-    record_start_time = 0.0
-
-    # Recording output handle (close cleanly)
-    current_output: FfmpegOutput | None = None
-
-    # Standby cooldown after stop
-    next_start_allowed_time = 0.0
-
-    # Create camera + encoder
-    picam = create_and_start_camera()
-    encoder = H264Encoder(bitrate=H264_BITRATE)
-
-    # Heartbeat + watchdog progress
-    frame_count = 0
-    last_heartbeat = time.monotonic()
-
-    last_progress = time.monotonic()
-    progress_lock = threading.Lock()
-    restart_camera_flag = threading.Event()
-
-    def touch_progress():
-        nonlocal last_progress
-        with progress_lock:
-            last_progress = time.monotonic()
-
-    def get_last_progress():
-        with progress_lock:
-            return last_progress
-
-    def watchdog():
+    def _run(self) -> None:
         while True:
             time.sleep(1.0)
-            since = time.monotonic() - get_last_progress()
-            if since > PROGRESS_TIMEOUT_SECONDS:
+            since = self._seconds_since_progress()
+            if since > self.timeout_seconds:
                 log(f"[watchdog] No progress for {since:.1f}s. Requesting camera restart...")
-                restart_camera_flag.set()
+                self.restart_flag.set()
 
-    threading.Thread(target=watchdog, daemon=True).start()
 
-    def restart_camera():
-        """Hard reset camera pipeline (fixes rare post-record deadlock)."""
-        nonlocal picam, encoder, is_recording, current_output
-        log("[recovery] Restarting camera pipeline...")
-        try:
-            if is_recording:
-                try:
-                    stop_recording(picam, current_output)
-                except Exception:
-                    pass
-            current_output = None
-            is_recording = False
-        except Exception:
-            pass
+# ---------------------------
+# 7) STATE MACHINE
+# ---------------------------
 
-        safe_stop_close_camera(picam)
-        time.sleep(0.3)
+@dataclass
+class RuntimeState:
+    is_recording: bool = False
 
-        picam = create_and_start_camera()
-        encoder = H264Encoder(bitrate=H264_BITRATE)
-        log("[recovery] Camera restarted.")
-        restart_camera_flag.clear()
+    # Start gating
+    consecutive_hits: int = 0
+    pending_label: Optional[str] = None
 
-    log(f"System Ready. Monitoring for: {', '.join(TARGET_ANIMALS)}")
-    log(
-        f"Start: {START_CONFIRM_FRAMES} hits @ conf>={START_MIN_CONF} | "
-        f"Stop: {STOP_CONFIRM_FRAMES} misses | "
-        f"Keep conf>={KEEP_MIN_CONF} | "
-        f"MIN_RECORD_SECONDS={MIN_RECORD_SECONDS} | "
-        f"POST_RECORD_COOLDOWN_SECONDS={POST_RECORD_COOLDOWN_SECONDS} | "
-        f"DETECT_FPS={DETECT_FPS}"
-    )
-    log("[standby] Waiting for animals...")
+    # Stop gating
+    misses_while_recording: int = 0
 
-    while True:
-        # If watchdog asked for restart, do it here (main thread)
-        if restart_camera_flag.is_set():
-            restart_camera()
+    # Cooldown
+    next_start_allowed_time: float = 0.0
 
-        touch_progress()
-        frame_count += 1
+    # Heartbeat
+    last_heartbeat: float = time.monotonic()
+    cooldown_announced: bool = False
+
+    # Debug frame counter
+    frame_count: int = 0
+
+
+def should_print_progress(cfg: Settings, state: RuntimeState) -> bool:
+    return cfg.print_detection_progress and (state.frame_count % max(1, cfg.print_progress_every_n_frames) == 0)
+
+
+def handle_heartbeat(cfg: Settings, state: RuntimeState, now_m: float, now: float) -> None:
+    if state.is_recording:
+        return
+
+    if (now_m - state.last_heartbeat) < cfg.heartbeat_seconds:
+        return
+
+    wait_left = max(0.0, state.next_start_allowed_time - now)
+    if wait_left > 0:
+        log(f"[standby] Alive. Cooldown {wait_left:.1f}s remaining...")
+        state.cooldown_announced = True
+    else:
+        if state.cooldown_announced:
+            log("[standby] Cooldown ended. Ready to trigger.")
+            state.cooldown_announced = False
+        else:
+            log("[standby] Alive. Ready to trigger.")
+
+    state.last_heartbeat = now_m
+
+
+def in_post_stop_cooldown(state: RuntimeState, now: float) -> bool:
+    return now < state.next_start_allowed_time
+
+
+def start_logic(cfg: Settings, state: RuntimeState, animal: str, conf: float) -> bool:
+    """
+    Update gating counters and return True if we should start recording now.
+    Only strong detections count toward start.
+    """
+    if conf < cfg.start_min_conf:
+        state.consecutive_hits = 0
+        state.pending_label = None
+        return False
+
+    if state.pending_label == animal:
+        state.consecutive_hits += 1
+    else:
+        state.pending_label = animal
+        state.consecutive_hits = 1
+
+    return state.consecutive_hits >= cfg.start_confirm_frames
+
+
+def stop_logic(cfg: Settings, recorder: Recorder, state: RuntimeState, now: float, animal: Optional[str]) -> bool:
+    """
+    Update miss counter and return True if we should stop now.
+    Any detection keeps recording alive. Stop after N misses and min duration elapsed.
+    """
+    if animal:
+        state.misses_while_recording = 0
+        return False
+
+    state.misses_while_recording += 1
+
+    elapsed = now - recorder.record_start_time
+    if elapsed < cfg.min_record_seconds:
+        return False
+
+    return state.misses_while_recording >= cfg.stop_confirm_frames
+
+
+# ---------------------------
+# 8) APP / MAIN LOOP
+# ---------------------------
+
+class BirdingApp:
+    def __init__(self, cfg: Settings):
+        self.cfg = cfg
+        self.cam = CameraManager(cfg)
+        self.detector = AnimalDetector(cfg)
+        self.recorder = Recorder(cfg)
+        self.state = RuntimeState()
+        self.watchdog = ProgressWatchdog(cfg.progress_timeout_seconds)
+
+    def setup(self) -> None:
+        log("Initializing birding system...")
+        if self.cfg.enable_manual_focus:
+            set_manual_focus(self.cfg.winning_focus)
+
+        self.cam.start()
+        self.watchdog.start()
+
+        log(f"System Ready. Monitoring for: {', '.join(self.cfg.target_animals)}")
+        log(
+            f"Start: {self.cfg.start_confirm_frames} hits @ conf>={self.cfg.start_min_conf} | "
+            f"Stop: {self.cfg.stop_confirm_frames} misses | "
+            f"Keep conf>={self.cfg.keep_min_conf} | "
+            f"MIN_RECORD_SECONDS={self.cfg.min_record_seconds} | "
+            f"POST_RECORD_COOLDOWN_SECONDS={self.cfg.post_record_cooldown_seconds} | "
+            f"DETECT_FPS={self.cfg.detect_fps}"
+        )
+        log("[standby] Waiting for animals...")
+
+    def restart_camera_now(self, reason: str) -> None:
+        # Ensure we are not recording
+        if self.state.is_recording:
+            try:
+                self.recorder.stop(self.cam)
+            except Exception:
+                pass
+        self.state.is_recording = False
+        self.recorder.output = None
+        self.state.misses_while_recording = 0
+        self.state.consecutive_hits = 0
+        self.state.pending_label = None
+
+        self.cam.restart(reason=reason)
+        self.watchdog.restart_flag.clear()
+
+    def start_recording(self, animal: str) -> None:
+        filename = self.recorder.make_filename(animal)
+        log(f"DETECTION CONFIRMED: {animal.upper()} x{self.state.consecutive_hits} | Starting record: {filename}")
+        self.recorder.start(self.cam, filename)
+        self.state.is_recording = True
+        self.state.misses_while_recording = 0
+        self.state.consecutive_hits = 0
+        self.state.pending_label = None
+
+    def stop_recording(self) -> None:
+        log(f"Target likely gone (misses={self.state.misses_while_recording}). Stopping recording.")
+        self.recorder.stop(self.cam)
+
+        # Re-arm standby
+        self.state.is_recording = False
+        self.state.misses_while_recording = 0
+        self.state.consecutive_hits = 0
+        self.state.pending_label = None
+        self.state.next_start_allowed_time = time.time() + self.cfg.post_record_cooldown_seconds
+
+        log("[standby] Ready for next animal...")
+
+        # IMPORTANT: hard reset after every stop (your preference)
+        self.cam.restart(reason="post-record restart")
+
+    def tick(self) -> None:
+        """One iteration of the event loop."""
+        # Watchdog requested a restart?
+        if self.watchdog.restart_flag.is_set():
+            self.restart_camera_now("watchdog stall")
+
+        self.watchdog.touch()
+        self.state.frame_count += 1
+
         now_m = time.monotonic()
         now = time.time()
 
-        # Heartbeat
-        if (now_m - last_heartbeat) >= HEARTBEAT_SECONDS and not is_recording:
-            wait_left = max(0.0, next_start_allowed_time - now)
-            if wait_left > 0:
-                log(f"[standby] Alive. Cooldown {wait_left:.1f}s remaining...")
-                cooldown_announced = True
-            else:
-                if cooldown_announced:
-                    log("[standby] Cooldown ended. Ready to trigger.")
-                    cooldown_announced = False
-                else:
-                    log("[standby] Alive. Ready to trigger.")
-            last_heartbeat = now_m
+        handle_heartbeat(self.cfg, self.state, now_m, now)
 
-        # Capture + detection (can block => watchdog will request restart)
-        frame = capture_bgr_frame(picam)
-        touch_progress()
-        animal, conf = get_best_detection(model, frame)
-        touch_progress()
+        # Capture + detect (common stall point)
+        frame = self.cam.capture_bgr_from_lores()
+        self.watchdog.touch()
+        animal, conf = self.detector.best_target(frame)
+        self.watchdog.touch()
 
-        # Print detections
-        if PRINT_DETECTION_PROGRESS and (animal is not None) and (frame_count % PRINT_PROGRESS_EVERY_N_FRAMES == 0):
-            if not is_recording:
-                gate = "strong" if conf >= START_MIN_CONF else "weak"
-                log(f"[detect-{gate}] {animal} conf={conf:.2f}")
-            else:
+        # Debug print
+        if animal and should_print_progress(self.cfg, self.state):
+            if self.state.is_recording:
                 log(f"[keep] {animal} conf={conf:.2f} (recording)")
-
-        # --- While recording ---
-        if is_recording:
-            if animal:
-                misses_while_recording = 0
             else:
-                misses_while_recording += 1
+                gate = "strong" if conf >= self.cfg.start_min_conf else "weak"
+                log(f"[detect-{gate}] {animal} conf={conf:.2f}")
 
-            elapsed = now - record_start_time
-            if elapsed >= MIN_RECORD_SECONDS and misses_while_recording >= STOP_CONFIRM_FRAMES:
-                log(f"Target likely gone (misses={misses_while_recording}). Stopping recording.")
-                stop_recording(picam, current_output)
-                current_output = None
-
-                # Re-arm standby
-                is_recording = False
-                misses_while_recording = 0
-                consecutive_hits = 0
-                pending_label = None
-                next_start_allowed_time = time.time() + POST_RECORD_COOLDOWN_SECONDS
-
-                log("[standby] Ready for next animal...")
-
-                # IMPORTANT: hard-reset camera after each recording stop (prevents deadlock)
-                restart_camera()
-
-            time.sleep(1.0 / DETECT_FPS)
-            continue
-
-        # --- Not recording: cooldown gate ---
-        if now < next_start_allowed_time:
-            consecutive_hits = 0
-            pending_label = None
-            time.sleep(1.0 / DETECT_FPS)
-            continue
-
-        # --- Not recording: start gating with strong detections ---
-        if animal and conf >= START_MIN_CONF:
-            if pending_label == animal:
-                consecutive_hits += 1
-            else:
-                pending_label = animal
-                consecutive_hits = 1
-
-            if consecutive_hits >= START_CONFIRM_FRAMES:
-                filename = make_filename(animal)
-                log(f"DETECTION CONFIRMED: {animal.upper()} x{consecutive_hits} | Starting record: {filename}")
-                current_output = start_recording(picam, encoder, filename)
-                is_recording = True
-                record_start_time = time.time()
-                misses_while_recording = 0
-                consecutive_hits = 0
-                pending_label = None
+        # Recording state machine
+        if self.state.is_recording:
+            if stop_logic(self.cfg, self.recorder, self.state, now, animal):
+                self.stop_recording()
         else:
-            consecutive_hits = 0
-            pending_label = None
+            if in_post_stop_cooldown(self.state, now):
+                # Don't accumulate hits in cooldown
+                self.state.consecutive_hits = 0
+                self.state.pending_label = None
+            else:
+                if animal:
+                    if start_logic(self.cfg, self.state, animal, conf):
+                        self.start_recording(animal)
+                else:
+                    self.state.consecutive_hits = 0
+                    self.state.pending_label = None
 
-        time.sleep(1.0 / DETECT_FPS)
+        time.sleep(1.0 / self.cfg.detect_fps)
+
+    def run_forever(self) -> None:
+        self.setup()
+        while True:
+            self.tick()
+
+    def shutdown(self) -> None:
+        log("\nShutting down safely...")
+        try:
+            if self.state.is_recording:
+                self.recorder.stop(self.cam)
+        except Exception:
+            pass
+        self.cam.stop_close()
 
 
 def main():
-    log("Initializing birding system...")
-    if ENABLE_MANUAL_FOCUS:
-        set_manual_focus(WINNING_FOCUS)
-
-    model = YOLO('yolov8n.pt')
-
+    app = BirdingApp(CFG)
     try:
-        run_event_loop(model)
+        app.run_forever()
     except KeyboardInterrupt:
-        log("\nShutting down safely...")
+        pass
+    finally:
+        app.shutdown()
 
 
 if __name__ == "__main__":
