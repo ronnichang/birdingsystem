@@ -5,7 +5,7 @@ from picamera2 import Picamera2
 picam2 = Picamera2()
 
 # 2. Configure for 1080p video (without the 'codec' argument here)
-config = picam2.create_video_configuration(main={'size': (1920, 1080)})
+config = picam2.create_video_configuration(main={'size': (1280, 720)})
 picam2.configure(config)
 
 # 3. Start the camera
