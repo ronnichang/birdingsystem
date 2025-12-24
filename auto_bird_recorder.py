@@ -79,7 +79,7 @@ def log(msg: str) -> None:
 
 
 # ---------------------------
-# 2) OPTIONAL FOCUS CONTROL
+# 2) CAMERA FOCUS CONTROL (if camera is motorized)
 # ---------------------------
 
 def set_manual_focus(val: int) -> None:
