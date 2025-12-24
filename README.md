@@ -1,6 +1,10 @@
-# Proj-birding (Raspberry Pi 4)
+# DIY Birding System empowered by Raspberry Pi 4
 
-A Raspberry Pi 4 “birding / backyard wildlife” recorder that:
+A Raspberry Pi 4 “birding / backyard wildlife” recorder automatically detects approaching birds
+or animals of interest. Upon a bird being detected, the system starts recording till the bird 
+leaves.
+
+Major technical steps:
 - Runs **YOLO (Ultralytics YOLOv8n)** on a low-res camera stream to detect animals.
 - Starts recording when a target animal is detected for **N consecutive frames**.
 - Stops recording after **M consecutive misses** (hysteresis) and a minimum clip length.
