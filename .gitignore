@@ -3,4 +3,5 @@ venv/
 captures/
 *.jpg
 *.mp4
+*.wav
 *.pt

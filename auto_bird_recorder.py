@@ -17,6 +17,8 @@ import cv2
 import time
 import datetime
 import threading
+import subprocess
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -56,6 +58,10 @@ class Settings:
     yolo_img_size: int = 320
     h264_bitrate: int = 8_000_000
     buffer_count: int = 6
+
+    # Audio 
+    audio_device: str = "plughw:1,0"   # from arecord -l => card 1, device 0
+    audio_gain: float = 3.0            # boost quiet mic; set 1.0 to disable
 
     # Debug
     print_detection_progress: bool = True
@@ -214,26 +220,81 @@ class AnimalDetector:
 # ---------------------------
 
 class Recorder:
-    """Handles file naming and Picamera2 recording start/stop (including FfmpegOutput close)."""
-
+    """
+    Records video via Picamera2 and audio via arecord, then muxes them into one MP4.
+    """
     def __init__(self, cfg: Settings):
         self.cfg = cfg
         self.output: Optional[FfmpegOutput] = None
         self.record_start_time: float = 0.0
+
+        self._arecord: Optional[subprocess.Popen] = None
+        self._video_tmp: Optional[str] = None
+        self._audio_tmp: Optional[str] = None
+        self._final_path: Optional[str] = None
+
+    def _start_audio(self, wav_path: str) -> None:
+        # -f cd => 44100 Hz, S16_LE, stereo. Can change to -r 48000 if preferred.
+        cmd = [
+            "arecord",
+            "-D", self.cfg.audio_device,
+            "-f", "cd",
+            "-t", "wav",
+            wav_path,
+        ]
+        self._arecord = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def _stop_audio(self) -> None:
+        if self._arecord is None:
+            return
+        try:
+            self._arecord.terminate()
+            self._arecord.wait(timeout=2.0)
+        except Exception:
+            try:
+                self._arecord.kill()
+            except Exception:
+                pass
+        finally:
+            self._arecord = None
 
     def make_filename(self, animal: str) -> str:
         now = datetime.datetime.now()
         base = now.strftime(f"%Y%m%d-%H%M%S-{animal}.mp4")
         return os.path.join(self.cfg.capture_dir, base)
 
-    def start(self, cam: CameraManager, filename: str) -> None:
+    def start(self, cam: CameraManager, final_filename: str) -> None:
+        """Start video and audio. Video goes to a temp mp4; final mp4 created at stop."""
         assert cam.picam is not None and cam.encoder is not None
-        self.output = FfmpegOutput(filename)
+
+        final_path = Path(final_filename)
+        stem = final_path.stem  # YYYYMMDD-HHMMSS-animal
+
+        video_tmp = str(final_path.with_name(stem + ".video.mp4"))
+        audio_tmp = str(final_path.with_name(stem + ".audio.wav"))
+
+        self._final_path = str(final_path)
+        self._video_tmp = video_tmp
+        self._audio_tmp = audio_tmp
+
+        # Start audio first (so we don't miss the beginning)
+        self._start_audio(audio_tmp)
+
+        # Start video
+        self.output = FfmpegOutput(video_tmp)
         cam.picam.start_recording(cam.encoder, self.output)
+
         self.record_start_time = time.time()
 
     def stop(self, cam: CameraManager) -> None:
+        """Stop video+audio and mux into final mp4."""
         assert cam.picam is not None
+
+        # Stop video
         cam.picam.stop_recording()
         if self.output is not None:
             try:
@@ -241,6 +302,44 @@ class Recorder:
             except Exception:
                 pass
         self.output = None
+
+        # Stop audio
+        self._stop_audio()
+
+        if not (self._video_tmp and self._audio_tmp and self._final_path):
+            return
+
+        # Mux video + audio
+        # -c:v copy => no re-encode video (fast)
+        # -c:a aac => encode audio into mp4
+        # -shortest => stop at the shorter stream
+        # optional: boost audio volume if the mic is quiet
+        af = f"volume={self.cfg.audio_gain}" if self.cfg.audio_gain and self.cfg.audio_gain != 1.0 else "anull"
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", self._video_tmp,
+            "-i", self._audio_tmp,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-af", af,
+            "-shortest",
+            self._final_path,
+        ]
+
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Cleanup temp files
+        for p in (self._video_tmp, self._audio_tmp):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+
+        self._video_tmp = None
+        self._audio_tmp = None
+        self._final_path = None
 
 
 # ---------------------------
