@@ -398,11 +398,11 @@ class Recorder:
             except Exception:
                 pass
 
-            abr.log(f"[audio] ffmpeg mux FAILED. See log: {mux_log}")
+            log(f"[audio] ffmpeg mux FAILED. See log: {mux_log}")
 
             # Keep temp files for debugging if requested
             if self.cfg.keep_failed_mux_files:
-                abr.log(f"[audio] Keeping temp files:\n  {self._video_tmp}\n  {self._audio_tmp}")
+                log(f"[audio] Keeping temp files:\n  {self._video_tmp}\n  {self._audio_tmp}")
                 return
         else:
             # Optional: write log even on success when debug enabled
