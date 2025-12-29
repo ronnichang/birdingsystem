@@ -62,7 +62,7 @@ class Settings:
 
     # Audio 
     audio_device: str = "plughw:1,0"   # from arecord -l => card 1, device 0
-    audio_gain: float = 3.0            # boost quiet mic; set 1.0 to disable
+    audio_gain: float = 5.0            # boost quiet mic; set 1.0 to disable
 
     # Debug
     print_detection_progress: bool = True
