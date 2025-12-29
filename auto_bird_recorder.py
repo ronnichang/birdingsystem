@@ -18,6 +18,7 @@ import time
 import datetime
 import threading
 import subprocess
+import signal
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -75,9 +76,15 @@ class Settings:
     capture_dir: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "captures")
     yolo_weights: str = "yolov8n.pt"
 
+    # A/V debug
+    debug_av: bool = True
+    keep_failed_mux_files: bool = True
+    av_log_dir: str = os.path.join(capture_dir, "avlogs")
+
 
 CFG = Settings()
 os.makedirs(CFG.capture_dir, exist_ok=True)
+os.makedirs(CFG.av_log_dir, exist_ok=True)
 
 
 def log(msg: str) -> None:
@@ -234,7 +241,10 @@ class Recorder:
         self._final_path: Optional[str] = None
 
     def _start_audio(self, wav_path: str) -> None:
-        # -f cd => 44100 Hz, S16_LE, stereo. Can change to -r 48000 if preferred.
+        """
+        Start arecord to write a WAV file. We start it in a new session so we can
+        send SIGINT to the whole process group (clean WAV header).
+        """
         cmd = [
             "arecord",
             "-D", self.cfg.audio_device,
@@ -242,24 +252,63 @@ class Recorder:
             "-t", "wav",
             wav_path,
         ]
+
+        stderr = subprocess.DEVNULL
+        if self.cfg.debug_av:
+            ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            log_path = os.path.join(self.cfg.av_log_dir, f"arecord-{ts}.log")
+            stderr = open(log_path, "wb")
+
+        # start_new_session=True => creates new process group/session
         self._arecord = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=stderr,
+            start_new_session=True,
         )
 
     def _stop_audio(self) -> None:
+        """
+        Stop arecord smoothly. SIGINT is preferred for proper WAV finalization.
+        Fallback to terminate/kill if needed.
+        """
         if self._arecord is None:
             return
+
+        p = self._arecord
+
         try:
-            self._arecord.terminate()
-            self._arecord.wait(timeout=2.0)
-        except Exception:
+            # Preferred: SIGINT like Ctrl+C
             try:
-                self._arecord.kill()
+                os.killpg(p.pid, signal.SIGINT)
+            except Exception:
+                # If process group kill fails, try direct SIGINT
+                try:
+                    p.send_signal(signal.SIGINT)
+                except Exception:
+                    pass
+
+            p.wait(timeout=3.0)
+
+        except subprocess.TimeoutExpired:
+            # Fallback: terminate then kill
+            try:
+                p.terminate()
+                p.wait(timeout=2.0)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+
+        finally:
+            # If we opened a log file, close it
+            try:
+                if p.stderr not in (None, subprocess.DEVNULL):
+                    p.stderr.close()
             except Exception:
                 pass
-        finally:
+
             self._arecord = None
 
     def make_filename(self, animal: str) -> str:
@@ -320,15 +369,49 @@ class Recorder:
             "ffmpeg", "-y",
             "-i", self._video_tmp,
             "-i", self._audio_tmp,
+            "-map", "0:v:0", # map video from input 0
+            "-map", "1:a:0", # map audio from input 1
             "-c:v", "copy",
             "-c:a", "aac",
             "-b:a", "128k",
             "-af", af,
             "-shortest",
+            "-movflags", "+faststart", # optional but nice for web playback
             self._final_path,
         ]
 
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        mux_log = os.path.join(self.cfg.av_log_dir, f"ffmpeg-mux-{ts}.log")
+
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            # Write ffmpeg stderr to log
+            try:
+                with open(mux_log, "w", encoding="utf-8") as f:
+                    f.write(result.stderr or "")
+            except Exception:
+                pass
+
+            abr.log(f"[audio] ffmpeg mux FAILED. See log: {mux_log}")
+
+            # Keep temp files for debugging if requested
+            if self.cfg.keep_failed_mux_files:
+                abr.log(f"[audio] Keeping temp files:\n  {self._video_tmp}\n  {self._audio_tmp}")
+                return
+        else:
+            # Optional: write log even on success when debug enabled
+            if self.cfg.debug_av:
+                try:
+                    with open(mux_log, "w", encoding="utf-8") as f:
+                        f.write(result.stderr or "")
+                except Exception:
+                    pass
 
         # Cleanup temp files
         for p in (self._video_tmp, self._audio_tmp):
