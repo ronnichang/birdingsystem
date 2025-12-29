@@ -17,6 +17,7 @@ import datetime
 import subprocess
 
 import cv2
+from sympy import ff
 
 # Reuse your existing implementation
 import auto_bird_recorder as abr
@@ -42,10 +43,12 @@ OVERLAY_HEARTBEAT_SECONDS = 1.0
 def start_ffmpeg_writer(out_path: str, width: int, height: int, fps: int) -> subprocess.Popen:
     """
     Start ffmpeg process to accept raw BGR frames on stdin and write an MP4.
-    Uses libx264 (software) by default.
+    IMPORTANT: Don't PIPE stderr unless you read it (ffmpeg writes progress to stderr).
     """
     cmd = [
         "ffmpeg", "-y",
+        "-loglevel", "error",
+        "-nostats",
         "-f", "rawvideo",
         "-pix_fmt", "bgr24",
         "-s", f"{width}x{height}",
@@ -55,10 +58,13 @@ def start_ffmpeg_writer(out_path: str, width: int, height: int, fps: int) -> sub
         "-preset", "veryfast",
         "-crf", "23",
         "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
+
+        # Better for “recording while running”; still fine after Ctrl+C
+        "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+
         out_path
     ]
-    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
 
 def overlay_hud(frame_bgr, lines, is_recording: bool, rec_flash_on: bool):
@@ -113,6 +119,44 @@ def build_overlay_lines(cfg: abr.Settings, state: abr.RuntimeState, animal, conf
         f"Start gate: {cfg.start_confirm_frames} @ conf>={cfg.start_min_conf:.2f} | "
         f"Stop gate: {cfg.stop_confirm_frames} misses | MinRec: {cfg.min_record_seconds:.1f}s",
     ]
+
+
+def close_ffmpeg(ff: subprocess.Popen, timeout: float = 8.0) -> None:
+    """Close ffmpeg cleanly so MP4 is finalized (moov written)."""
+    if ff is None:
+        return
+
+    try:
+        if ff.stdin:
+            try:
+                ff.stdin.flush()
+            except Exception:
+                pass
+            try:
+                ff.stdin.close()
+            except Exception:
+                pass
+
+        try:
+            ff.wait(timeout=timeout)
+            return
+        except Exception:
+            pass
+
+        # If it didn't exit, terminate then kill.
+        try:
+            ff.terminate()
+            ff.wait(timeout=3.0)
+            return
+        except Exception:
+            pass
+
+        try:
+            ff.kill()
+        except Exception:
+            pass
+    finally:
+        pass
 
 
 def demo_loop(cfg: abr.Settings) -> None:
@@ -242,7 +286,11 @@ def demo_loop(cfg: abr.Settings) -> None:
             vis = cv2.resize(frame_lores_bgr, DEMO_OUTPUT_RESOLUTION, interpolation=cv2.INTER_LINEAR)
             lines = build_overlay_lines(cfg, state, animal, conf, overlay_heartbeat)
             vis = overlay_hud(vis, lines, state.is_recording, rec_flash_on)
-            ff.stdin.write(vis.tobytes())
+            try:
+                ff.stdin.write(vis.tobytes())
+            except BrokenPipeError:
+                abr.log("[demo] ffmpeg pipe broke (ffmpeg exited). Stopping demo loop.")
+                break
 
             # Throttle to demo fps
             elapsed = time.time() - loop_start
@@ -253,26 +301,7 @@ def demo_loop(cfg: abr.Settings) -> None:
 
     finally:
         # Close ffmpeg cleanly
-        try:
-            if ff.stdin:
-                ff.stdin.close()
-            ff.wait(timeout=5)
-        except Exception:
-            pass
-
-        # Shutdown camera/recorder
-        try:
-            if state.is_recording:
-                try:
-                    recorder.stop(cam)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        cam.stop_close()
-
-        abr.log(f"Demo saved: {demo_path}")
-        abr.log("Download it to your laptop and play it — overlays are burned into the MP4.")
+        close_ffmpeg(ff)
 
 
 def main():
