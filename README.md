@@ -38,3 +38,13 @@ leaves.
 
 - `captures/`  
   Output directory for recordings and demo videos.
+
+---
+
+## Install system-wide environment
+`sudo apt update`
+`sudo apt install -y $(grep -vE '^\s*#|^\s*$' requirements.pi.apt.txt)`
+
+## Install pip environment
+`source .venv/bin/activate`
+`pip install -r requirements.txt` 

@@ -1,0 +1,2 @@
+ultralytics==8.3.241
+ultralytics-thop==2.0.18

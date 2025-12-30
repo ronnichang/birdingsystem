@@ -1,0 +1,6 @@
+ffmpeg
+python3-picamera2
+rpicam-apps
+python3-opencv
+python3-torch
+python3-torchvision
