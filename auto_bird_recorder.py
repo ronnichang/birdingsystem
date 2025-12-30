@@ -61,7 +61,7 @@ class Settings:
     buffer_count: int = 6
 
     # Audio 
-    audio_device: str = "plughw:1,0"   # from arecord -l => card 1, device 0
+    audio_device: str = "plughw:3,0"   # from arecord -l => card 3, device 0
     audio_gain: float = 5.0            # boost quiet mic; set 1.0 to disable
 
     # Debug
