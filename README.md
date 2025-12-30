@@ -41,10 +41,19 @@ leaves.
 
 ---
 
-## Install system-wide environment
-`sudo apt update`
-`sudo apt install -y $(grep -vE '^\s*#|^\s*$' requirements.pi.apt.txt)`
+## System-wide environment
 
-## Install pip environment
-`source .venv/bin/activate`
-`pip install -r requirements.txt` 
+```bash
+sudo apt update
+sudo apt install -y ffmpeg python3-picamera2 rpicam-apps python3-opencv python3-torch python3-torchvision
+
+
+## Python environment (venv)
+
+From the project root:
+
+```bash
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+pip install -U pip wheel
+pip install -r requirements.txt
