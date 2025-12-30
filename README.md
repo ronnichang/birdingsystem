@@ -46,7 +46,7 @@ leaves.
 ```bash
 sudo apt update
 sudo apt install -y ffmpeg python3-picamera2 rpicam-apps python3-opencv python3-torch python3-torchvision
-
+```
 
 ## Python environment (venv)
 
@@ -57,3 +57,4 @@ python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
 pip install -U pip wheel
 pip install -r requirements.txt
+```
