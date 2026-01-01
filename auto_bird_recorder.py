@@ -35,6 +35,13 @@ from picamera2.outputs import FfmpegOutput
 
 @dataclass(frozen=True)
 class Settings:
+    """Immutable configuration for the birding recorder.
+
+    This dataclass centralizes tunables for camera setup, YOLO detection,
+    recording start/stop gating, audio capture/muxing, logging verbosity,
+    and watchdog timeouts. Edit values here and restart the service to apply.
+    """
+
     # Focus
     enable_manual_focus: bool = False
     winning_focus: int = 500
@@ -483,6 +490,11 @@ class ProgressWatchdog:
 
 @dataclass
 class RuntimeState:
+    """Mutable runtime state for the main event loop.
+
+    Holds counters and timestamps used by the start/stop gating logic,
+    post-stop cooldown, heartbeat messages, and debug frame counting.
+    """
     is_recording: bool = False
 
     # Start gating
@@ -574,6 +586,12 @@ def stop_logic(cfg: Settings, recorder: Recorder, state: RuntimeState, now: floa
 # ---------------------------
 
 class BirdingApp:
+    """Top-level application orchestrator.
+
+    Wires together CameraManager, AnimalDetector, Recorder, and ProgressWatchdog,
+    then runs the detection/recording state machine in a simple timed loop.
+    Also provides graceful startup/recovery/shutdown behavior for systemd.
+    """
     def __init__(self, cfg: Settings):
         self.cfg = cfg
         self.cam = CameraManager(cfg)
