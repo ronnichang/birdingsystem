@@ -91,6 +91,13 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
+# Graceful shutdown support (systemd sends SIGTERM) 
+STOP_EVENT = threading.Event()
+def _request_stop(signum, frame):
+    log(f"[signal] Received signal {signum}; shutting down gracefully...")
+    STOP_EVENT.set()
+
+
 # ---------------------------
 # 2) CAMERA FOCUS CONTROL (if camera is motorized)
 # ---------------------------
@@ -457,10 +464,18 @@ class ProgressWatchdog:
         while True:
             time.sleep(1.0)
             since = self._seconds_since_progress()
+
             if since > self.timeout_seconds:
                 log(f"[watchdog] No progress for {since:.1f}s. Requesting camera restart...")
                 self.restart_flag.set()
 
+            # HARD FAILSAFE:
+            # If the main thread is blocked in a C call, it can't act on restart_flag.
+            # Exit the process so systemd restarts cleanly.
+            if since > (self.timeout_seconds + 15.0):
+                log(f"[watchdog] Still stuck after {since:.1f}s. Exiting so systemd can restart...")
+                os._exit(1)
+                
 
 # ---------------------------
 # 7) STATE MACHINE
@@ -676,7 +691,7 @@ class BirdingApp:
 
     def run_forever(self) -> None:
         self.setup()
-        while True:
+        while not STOP_EVENT.is_set():
             self.tick()
 
     def shutdown(self) -> None:
@@ -690,6 +705,10 @@ class BirdingApp:
 
 
 def main():
+   # systemd stop => SIGTERM; make it graceful
+    signal.signal(signal.SIGTERM, _request_stop)
+    signal.signal(signal.SIGINT, _request_stop)  # keep Ctrl+C graceful too
+
     app = BirdingApp(CFG)
     try:
         app.run_forever()

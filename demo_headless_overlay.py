@@ -16,6 +16,8 @@ import time
 import datetime
 import subprocess
 import cv2
+import signal
+import threading
 
 import auto_bird_recorder as abr
 
@@ -28,6 +30,12 @@ DEMO_OUTPUT_RESOLUTION = (1280, 720)  # HUD video size
 DEMO_FPS = int(round(abr.CFG.detect_fps))
 REC_FLASH_PERIOD = 0.5
 OVERLAY_HEARTBEAT_SECONDS = 1.0
+STOP_EVENT = threading.Event()
+
+
+def _request_stop(signum, frame):
+    abr.log(f"[signal] Received signal {signum}; stopping demo...")
+    STOP_EVENT.set()
 
 
 def start_ffmpeg_writer(out_path: str, width: int, height: int, fps: int) -> subprocess.Popen:
@@ -158,6 +166,9 @@ def demo_loop(cfg: abr.Settings) -> None:
     if cfg.enable_manual_focus:
         abr.set_manual_focus(cfg.winning_focus)
 
+    signal.signal(signal.SIGTERM, _request_stop)
+    signal.signal(signal.SIGINT, _request_stop)
+
     cam.start()
     watchdog.start()
 
@@ -176,7 +187,7 @@ def demo_loop(cfg: abr.Settings) -> None:
     abr.log("[standby] Waiting for animals...")
 
     try:
-        while True:
+        while not STOP_EVENT.is_set():
             loop_start = time.time()
 
             # Watchdog restart request?
