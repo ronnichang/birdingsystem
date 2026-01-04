@@ -60,6 +60,7 @@ pip install -r requirements.txt
 ```
 
 ## Demo Videos
-- Full camera action from **power on → power off**: [YouTube](https://youtu.be/E2w8IsiXREs?si=CW3ZZTqgefNI25TH)
+- Full camera action from **power on → power off** (from `demo_headless_overlay.py`): [YouTube](https://youtu.be/E2w8IsiXREs?si=CW3ZZTqgefNI25TH). When the camera does not detect a bird, it is in the STANDBY mode. When a bird
+is detected, it is in the RECORDING mode, which will trigger video writing.
 - Auto-detected & recorded clip (from `auto_bird_recorder.py`) — example 1: [YouTube](https://youtu.be/dDopLY99IWo?si=3fvarHAWod5dv105)
 - Auto-detected & recorded clip (from `auto_bird_recorder.py`) — example 2: [YouTube](https://youtu.be/q5BS_q3UHrA?si=_YpgvA6xsWA2XPwC)
